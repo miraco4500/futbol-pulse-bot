@@ -21,10 +21,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -U pip
+          python -m pip install --upgrade pip
           pip install python-telegram-bot
 
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python bot.py
