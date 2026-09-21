@@ -873,4 +873,352 @@ def download_image(image_url):
 
         with urllib.request.urlopen(
             request,
-  
+            timeout=30
+        ) as response:
+
+            data = response.read()
+
+            content_type = response.headers.get(
+                "Content-Type",
+                ""
+            ).lower()
+
+            if (
+                data
+                and (
+                    content_type.startswith("image/")
+                    or data[:3] == b"\xff\xd8\xff"
+                    or data[:8] == b"\x89PNG\r\n\x1a\n"
+                )
+            ):
+                return data
+
+    except Exception as e:
+
+        print("Rasm yuklash xatosi:", repr(e))
+
+    return None
+
+
+# =========================================================
+# VAQTNI TOSHKENT VAQTIGA O'GIRISH
+# =========================================================
+
+def convert_utc_to_tashkent(utc_string):
+
+    if not utc_string:
+        return ""
+
+    try:
+
+        value = utc_string.strip()
+
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        if dt.tzinfo is None:
+            return ""
+
+        tashkent = dt.astimezone(TASHKENT_TZ)
+
+        return tashkent.strftime(
+            "%d.%m.%Y | %H:%M"
+        )
+
+    except Exception as e:
+
+        print("Vaqt konvertatsiyasi xatosi:", repr(e))
+
+        return ""
+
+
+# =========================================================
+# CATEGORY EMOJILAR
+# =========================================================
+
+CATEGORY_EMOJI = {
+    "player": "⭐",
+    "transfer": "🔄",
+    "match": "🔥",
+    "result": "⚽",
+    "injury": "🚑",
+    "manager": "🧠",
+    "breaking": "🚨",
+    "other": "📰",
+}
+
+
+# =========================================================
+# TELEGRAM POST
+# =========================================================
+
+def create_post(item):
+
+    category = item.get(
+        "category",
+        "other"
+    )
+
+    emoji = CATEGORY_EMOJI.get(
+        category,
+        "📰"
+    )
+
+    title = html.escape(
+        item.get("title_uz", "")
+    )
+
+    text = html.escape(
+        item.get("text_uz", "")
+    )
+
+    post = (
+        f"{emoji} <b>{title}</b>\n\n"
+        f"{text}"
+    )
+
+    # Bo'lajak muhim o'yin
+    if item.get("image_mode") == "ai":
+
+        match_time = convert_utc_to_tashkent(
+            item.get(
+                "match_datetime_utc",
+                ""
+            )
+        )
+
+        if match_time:
+
+            post += (
+                "\n\n"
+                f"🕐 <b>Toshkent vaqti:</b> "
+                f"{html.escape(match_time)}"
+            )
+
+        post += "\n\n🔥 <b>Muhim o'yin anonsi</b>"
+
+    post += (
+        "\n\n"
+        f'⚽ <a href="{CHANNEL_LINK}">'
+        f"Futbol Pulse</a>"
+    )
+
+    return post
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "⚽ <b>FUTBOL PULSE</b>\n\n"
+        "Bot muvaffaqiyatli ishlayapti! ✅\n\n"
+        "/news — eng muhim futbol yangiliklari",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# /NEWS
+# =========================================================
+
+async def news_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    status_message = await update.message.reply_text(
+        "⚽ Yangiliklar tekshirilmoqda...\n\n"
+        "🤖 Muhim yangiliklar saralanmoqda..."
+    )
+
+    try:
+
+        news = get_news()
+
+        if not news:
+
+            await status_message.edit_text(
+                "Hozircha mos va muhim yangilik topilmadi. ⚽"
+            )
+
+            return
+
+        selected = select_news_with_ai(news)
+
+        if not selected:
+
+            await status_message.edit_text(
+                "Hozircha yetarlicha muhim yangilik topilmadi. ⚽"
+            )
+
+            return
+
+        await status_message.edit_text(
+            f"🔥 {len(selected)} ta muhim yangilik topildi.\n"
+            "Postlar tayyorlanmoqda..."
+        )
+
+        for item in selected:
+
+            image_bytes = None
+
+            # ==========================================
+            # BO'LAJAK MUHIM O'YIN
+            # ==========================================
+
+            if item.get("image_mode") == "ai":
+
+                print(
+                    "AI match poster yaratilmoqda:",
+                    item["title_uz"]
+                )
+
+                image_bytes = generate_ai_match_image(
+                    item["title_uz"],
+                    item["text_uz"]
+                )
+
+            # ==========================================
+            # ODDIY YANGILIK
+            # ORIGINAL RASM
+            # ==========================================
+
+            if image_bytes is None:
+
+                image_url = item.get(
+                    "image_url"
+                )
+
+                if image_url:
+
+                    print(
+                        "Original rasm yuklanmoqda:",
+                        image_url
+                    )
+
+                    image_bytes = download_image(
+                        image_url
+                    )
+
+            post = create_post(item)
+
+            # Telegram photo caption 1024 belgidan oshmasligi kerak
+            if len(post) > 1000:
+
+                post = post[:990] + "..."
+
+            # ==========================================
+            # RASM BILAN
+            # ==========================================
+
+            if image_bytes:
+
+                photo = io.BytesIO(
+                    image_bytes
+                )
+
+                photo.name = "futbol_pulse.jpg"
+
+                try:
+
+                    await update.message.reply_photo(
+                        photo=photo,
+                        caption=post,
+                        parse_mode="HTML",
+                        disable_notification=False,
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "Rasmli post xatosi:",
+                        repr(e)
+                    )
+
+                    await update.message.reply_text(
+                        post,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+
+            # ==========================================
+            # RASMSIZ
+            # ==========================================
+
+            else:
+
+                await update.message.reply_text(
+                    post,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
+        await status_message.edit_text(
+            "✅ Muhim yangiliklar yuborildi."
+        )
+
+    except Exception as e:
+
+        print(
+            "NEWS COMMAND ERROR:",
+            repr(e)
+        )
+
+        await status_message.edit_text(
+            "❌ Yangiliklarni olishda xatolik yuz berdi."
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    print("====================================")
+    print("⚽ FUTBOL PULSE BOT")
+    print("====================================")
+    print("Bot ishga tushmoqda...")
+    print("Gemini text:", GEMINI_MODEL)
+    print("Gemini image:", GEMINI_IMAGE_MODEL)
+    print("Toshkent timezone: Asia/Tashkent")
+    print("====================================")
+
+    app = (
+        Application
+        .builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "news",
+            news_command
+        )
+    )
+
+    print("Bot polling rejimida ishlayapti...")
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
