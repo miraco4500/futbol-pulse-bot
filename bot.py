@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CHANNEL_USERNAME = "@Futbol_Pulse24"
 CHANNEL_LINK = "https://t.me/Futbol_Pulse24"
 
-GEMINI_MODEL = "gemini-3.1-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 RSS_URLS = [
     "https://www.theguardian.com/football/rss",
