@@ -1,75 +1,57 @@
 import os
-import json
 import urllib.request
-import urllib.parse
+import xml.etree.ElementTree as ET
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi")
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 
-def telegram(method, data=None):
-    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
-    if data:
-        data = urllib.parse.urlencode(data).encode()
-
-    request = urllib.request.Request(url, data=data)
-    with urllib.request.urlopen(request) as response:
-        return json.loads(response.read().decode())
+RSS_URL = "https://www.theguardian.com/football/rss"
 
 
-def send_message(chat_id, text):
-    telegram(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text
-        }
+def get_news():
+    request = urllib.request.Request(
+        RSS_URL,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = response.read()
+
+    root = ET.fromstring(data)
+
+    news = []
+
+    for item in root.findall(".//item")[:5]:
+        title = item.findtext("title", "")
+        link = item.findtext("link", "")
+
+        if title and link:
+            news.append((title, link))
+
+    return news
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚽ FUTBOL PULSE\n\n"
+        "Bot muvaffaqiyatli ishlayapti! ✅\n\n"
+        "/news — so‘nggi futbol yangiliklari"
     )
 
 
-def main():
-    offset = 0
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        articles = get_news()
 
-    print("⚽ Futbol Pulse bot ishga tushdi!")
+        if not articles:
+            await update.message.reply_text(
+                "Hozircha yangilik topilmadi."
+            )
+            return
 
-    while True:
-        result = telegram(
-            "getUpdates",
-            {
-                "offset": offset,
-                "timeout": 30
-            }
-        )
+        message = "⚽ FUTBOL PULSE — SO‘NGGI YANGILIKLAR\n\n"
 
-        for update in result.get("result", []):
-            offset = update["update_id"] + 1
-
-            message = update.get("message")
-
-            if not message:
-                continue
-
-            chat_id = message["chat"]["id"]
-            text = message.get("text", "")
-
-            if text == "/start":
-                send_message(
-                    chat_id,
-                    "⚽ FUTBOL PULSE\n\n"
-                    "Bot muvaffaqiyatli ishga tushdi! ✅\n\n"
-                    "Tez orada futbol yangiliklari, "
-                    "transferlar, o‘yinlar va statistikalar avtomatik chiqadi."
-                )
-
-            elif text == "/test":
-                send_message(
-                    chat_id,
-                    "✅ Futbol Pulse bot ishlayapti!"
-                )
-
-
-if __name__ == "__main__":
-    main()
+        for i, (title
