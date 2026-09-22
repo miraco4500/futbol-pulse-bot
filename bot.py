@@ -1,1224 +1,768 @@
+
 import os
-import json
 import re
+import json
 import html
-import io
 import base64
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import hashlib
+import time
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
+import feedparser
+from bs4 import BeautifulSoup
+from PIL import Image
+from io import BytesIO
 
 
-# =========================================================
-# FUTBOL PULSE BOT
-# =========================================================
+# ============================================================
+# FUTBOL PULSE - ONE SHOT PUBLISHER
+# GitHub Actions runs this script every 10 minutes.
+# ============================================================
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-CHANNEL_USERNAME = "@Futbol_Pulse24"
 CHANNEL_LINK = "https://t.me/Futbol_Pulse24"
 
-# Ishlayotgan Gemini text modeli
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+TEXT_MODEL = "gemini-3.5-flash"
+IMAGE_MODEL = "gemini-3.1-flash-image"
 
-# AI rasm modeli
-GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+STATE_FILE = "posted_news.json"
 
-# Toshkent vaqti
-TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
+REQUEST_TIMEOUT = 25
+MAX_ARTICLE_CHARS = 14000
+MAX_NEWS_PER_SOURCE = 12
+MAX_POSTS_PER_RUN = 4
+MAX_NEWS_AGE_HOURS = 72
 
+MIN_WIDTH = 900
+MIN_HEIGHT = 500
+MIN_BYTES = 40_000
 
-# =========================================================
-# RSS MANBALAR
-# =========================================================
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 Chrome/140 Safari/537.36 "
+        "FutbolPulseBot/5.0"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 RSS_FEEDS = [
-    "https://www.theguardian.com/football/rss",
-    "https://feeds.bbci.co.uk/sport/football/rss.xml",
+    {
+        "name": "BBC Sport",
+        "url": "https://feeds.bbci.co.uk/sport/football/rss.xml",
+    },
+    {
+        "name": "The Guardian Football",
+        "url": "https://www.theguardian.com/football/rss",
+    },
+    {
+        "name": "ESPN Soccer",
+        "url": "https://www.espn.com/espn/rss/soccer/news",
+    },
 ]
-
-
-# =========================================================
-# ASOSIY KLUBLAR
-# =========================================================
 
 MAJOR_CLUBS = [
-    "real madrid",
-    "barcelona",
-    "manchester united",
-    "manchester city",
-    "liverpool",
-    "arsenal",
-    "chelsea",
-    "tottenham",
-    "bayern munich",
-    "bayern",
-    "borussia dortmund",
-    "psg",
-    "paris saint-germain",
-    "juventus",
-    "inter milan",
-    "inter",
-    "ac milan",
-    "milan",
-    "atletico madrid",
-    "napoli",
-    "roma",
-    "newcastle",
-    "aston villa",
-    "al hilal",
-    "al nassr",
-    "al ahly",
-    "galatasaray",
-    "fenerbahce",
-    "ajax",
-    "benfica",
-    "porto",
+    "real madrid", "barcelona", "atletico madrid",
+    "manchester united", "manchester city", "liverpool",
+    "arsenal", "chelsea", "tottenham",
+    "bayern munich", "bayern", "borussia dortmund",
+    "psg", "paris saint-germain", "juventus",
+    "inter milan", "inter", "ac milan", "milan",
+    "napoli", "roma", "newcastle", "aston villa",
+    "al hilal", "al nassr", "galatasaray", "fenerbahce",
+    "benfica", "porto", "ajax",
 ]
-
-
-# =========================================================
-# MASHHUR FUTBOLCHILAR
-# =========================================================
 
 MAJOR_PLAYERS = [
-    "mbappe",
-    "kylian mbappe",
-    "vinicius",
-    "vinicius junior",
-    "bellingham",
-    "jude bellingham",
-    "haaland",
-    "erling haaland",
-    "salah",
-    "mohamed salah",
-    "lionel messi",
-    "messi",
-    "cristiano ronaldo",
-    "ronaldo",
-    "lewandowski",
-    "robert lewandowski",
-    "de bruyne",
-    "kevin de bruyne",
-    "rodri",
-    "yamal",
-    "lamine yamal",
-    "pedri",
-    "saka",
-    "bukayo saka",
-    "rashford",
-    "bruno fernandes",
-    "kane",
-    "harry kane",
-    "son heung-min",
-    "neymar",
-    "viktor gyokeres",
-    "osimhen",
-    "lautaro martinez",
-    "griezmann",
-    "foden",
-    "phil foden",
-    "palmer",
-    "cole palmer",
-    "musiala",
-    "wirtz",
+    "mbappe", "kylian mbappe", "vinicius", "vinicius junior",
+    "bellingham", "jude bellingham", "haaland", "erling haaland",
+    "salah", "mohamed salah", "messi", "lionel messi",
+    "ronaldo", "cristiano ronaldo", "lewandowski",
+    "de bruyne", "kevin de bruyne", "rodri",
+    "yamal", "lamine yamal", "pedri", "saka", "bukayo saka",
+    "rashford", "bruno fernandes", "kane", "harry kane",
+    "son heung-min", "neymar", "osimhen", "gyokeres",
+    "lautaro martinez", "griezmann", "foden", "phil foden",
+    "palmer", "cole palmer", "musiala", "wirtz",
 ]
-
-
-# =========================================================
-# KATTA MUSOBAQALAR
-# =========================================================
 
 MAJOR_COMPETITIONS = [
-    "champions league",
-    "uefa champions league",
-    "europa league",
-    "conference league",
-    "premier league",
-    "english premier league",
-    "la liga",
-    "laliga",
-    "serie a",
-    "bundesliga",
-    "ligue 1",
-    "world cup",
-    "world cup 2026",
-    "fifa world cup",
-    "euro",
-    "european championship",
-    "copa america",
-    "afcon",
-    "fa cup",
-    "carabao cup",
-    "copa del rey",
-    "super cup",
+    "champions league", "uefa champions league",
+    "europa league", "conference league",
+    "premier league", "la liga", "laliga", "serie a",
+    "bundesliga", "ligue 1", "world cup", "fifa world cup",
+    "euro", "european championship", "copa america",
+    "afcon", "fa cup", "carabao cup", "copa del rey",
 ]
-
-
-# =========================================================
-# YORDAMCHI FUNKSIYALAR
-# =========================================================
-
-def clean_text(text):
-    if not text:
-        return ""
-
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def safe_json(text):
-    """
-    Gemini JSON qaytarishda ba'zida ```json ... ``` ishlatadi.
-    Shuni tozalaydi.
-    """
-
-    text = text.strip()
-
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    # JSON massivini topishga harakat
-    start = text.find("[")
-    end = text.rfind("]")
-
-    if start != -1 and end != -1:
-        text = text[start:end + 1]
-
-    return json.loads(text)
-
-
-def contains_major_topic(text):
-    """
-    Yangilik katta klub, mashhur futbolchi yoki katta
-    musobaqaga tegishlimi?
-    """
-
-    text = text.lower()
-
-    for item in MAJOR_CLUBS:
-        if item in text:
-            return True
-
-    for item in MAJOR_PLAYERS:
-        if item in text:
-            return True
-
-    for item in MAJOR_COMPETITIONS:
-        if item in text:
-            return True
-
-    return False
-
-
-# =========================================================
-# GEMINI TEXT API
-# =========================================================
-
-def ask_gemini(prompt):
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-
-    data = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 5000
-        }
-    }
-
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            result = json.loads(response.read().decode("utf-8"))
-
-        candidates = result.get("candidates", [])
-
-        if not candidates:
-            print("Gemini javob bermadi.")
-            return ""
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-
-        text_parts = []
-
-        for part in parts:
-            if "text" in part:
-                text_parts.append(part["text"])
-
-        return "\n".join(text_parts).strip()
-
-    except urllib.error.HTTPError as e:
-
-        error_body = ""
-
-        try:
-            error_body = e.read().decode("utf-8")
-        except Exception:
-            pass
-
-        print("Gemini HTTP ERROR:", e.code)
-        print(error_body)
-
-        return ""
-
-    except Exception as e:
-
-        print("Gemini xatosi:", repr(e))
-
-        return ""
-
-
-# =========================================================
-# RSS RASMLARINI TOPISH
-# =========================================================
-
-def get_image_from_item(item):
-
-    # media:content
-    for child in item:
-        tag = child.tag.lower()
-
-        if "content" in tag or "thumbnail" in tag:
-
-            url = child.attrib.get("url")
-
-            if url and url.startswith("http"):
-                return url
-
-    # enclosure
-    for child in item:
-
-        if child.tag.lower().endswith("enclosure"):
-
-            url = child.attrib.get("url", "")
-            content_type = child.attrib.get("type", "")
-
-            if url and (
-                content_type.startswith("image/")
-                or re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", url, re.I)
-            ):
-                return url
-
-    # description ichidagi img
-    for child in item:
-
-        if child.tag.lower().endswith("description"):
-
-            description = child.text or ""
-
-            match = re.search(
-                r'<img[^>]+src=["\']([^"\']+)["\']',
-                description,
-                re.I,
-            )
-
-            if match:
-                return html.unescape(match.group(1))
-
-    return None
-
-
-# =========================================================
-# ARTICLE SAHIFASIDAN ORIGINAL RASM
-# =========================================================
-
-def get_og_image(article_url):
-
-    if not article_url:
-        return None
-
-    try:
-
-        request = urllib.request.Request(
-            article_url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/120 Safari/537.36"
-                )
-            }
-        )
-
-        with urllib.request.urlopen(request, timeout=20) as response:
-            html_data = response.read().decode(
-                "utf-8",
-                errors="ignore"
-            )
-
-        patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
-            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
-        ]
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                html_data,
-                re.I
-            )
-
-            if match:
-
-                image_url = html.unescape(match.group(1))
-
-                if image_url.startswith("http"):
-                    return image_url
-
-    except Exception as e:
-
-        print("Original rasm topilmadi:", repr(e))
-
-    return None
-
-
-# =========================================================
-# RSS YANGILIKLARNI OLISH
-# =========================================================
-
-def get_news():
-
-    all_news = []
-
-    for feed_url in RSS_FEEDS:
-
-        try:
-
-            request = urllib.request.Request(
-                feed_url,
-                headers={
-                    "User-Agent": "FutbolPulseBot/1.0"
-                }
-            )
-
-            with urllib.request.urlopen(
-                request,
-                timeout=30
-            ) as response:
-
-                xml_data = response.read()
-
-            root = ET.fromstring(xml_data)
-
-            for item in root.iter():
-
-                if not item.tag.lower().endswith("item"):
-                    continue
-
-                title = ""
-                link = ""
-                description = ""
-
-                for child in item:
-
-                    tag = child.tag.lower()
-
-                    if tag.endswith("title"):
-                        title = child.text or ""
-
-                    elif tag.endswith("link"):
-                        link = child.text or ""
-
-                    elif tag.endswith("description"):
-                        description = child.text or ""
-
-                title = clean_text(title)
-                description = clean_text(description)
-
-                if not title or not link:
-                    continue
-
-                image_url = get_image_from_item(item)
-
-                # RSS ichida rasm bo'lmasa article'dan qidiramiz
-                if not image_url:
-                    image_url = get_og_image(link)
-
-                combined = f"{title} {description}"
-
-                # Juda oddiy va mavzusiz yangiliklarni oldindan kamaytirish
-                if not contains_major_topic(combined):
-                    continue
-
-                all_news.append({
-                    "title": title,
-                    "description": description,
-                    "link": link,
-                    "image_url": image_url,
-                })
-
-        except Exception as e:
-
-            print("RSS xatosi:", repr(e))
-
-    # Duplicate olib tashlash
-    unique = []
-    seen = set()
-
-    for item in all_news:
-
-        key = item["title"].lower()
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique.append(item)
-
-    return unique[:30]
-
-
-# =========================================================
-# GEMINI YANGILIK TANLASH
-# =========================================================
-
-def select_news_with_ai(news):
-
-    if not news:
-        return []
-
-    news_text = []
-
-    for index, item in enumerate(news):
-
-        news_text.append(
-            f"""
-NEWS {index}
-
-TITLE:
-{item["title"]}
-
-DESCRIPTION:
-{item["description"]}
-
-SOURCE:
-{item["link"]}
-"""
-        )
-
-    prompt = f"""
-Sen Futbol Pulse uchun professional futbol muharririsan.
-
-Vazifang: berilgan yangiliklardan faqat futbol muxlislarini
-haqiqatan qiziqtiradigan eng muhimlarini tanlash.
-
-QAT'IY FILTR:
-
-1. Oddiy va ahamiyatsiz klublar haqidagi yangiliklarni tanlama.
-2. Katta va mashhur klublarga ustuvorlik ber:
-   Real Madrid, Barcelona, Manchester United, Manchester City,
-   Liverpool, Arsenal, Chelsea, Bayern, PSG, Juventus,
-   Inter, Milan, Atletico Madrid va boshqa katta klublar.
-3. Mashhur futbolchilar haqidagi muhim yangiliklarga ustuvorlik ber.
-4. Champions League, Premier League, La Liga, Serie A,
-   Bundesliga, Ligue 1, World Cup, EURO kabi katta musobaqalarga
-   ustuvorlik ber.
-5. Katta transferlar, muhim jarohatlar, murabbiy almashinuvi,
-   katta mojarolar yoki muhim rasmiy qarorlar qiziq.
-6. Oddiy mashg'ulot, oddiy intervyu, kichik klubning oddiy
-   yangiligi, past ahamiyatli statistikani tanlama.
-7. Bir xil mazmundagi yangiliklardan faqat bittasini tanla.
-8. Eng ko'p qiziqish uyg'otadigan yangiliklarni yuqoriga qo'y.
-9. Maksimal 5 ta yangilik tanla.
-10. Hech qanday faktni o'zingdan qo'shma.
-
-O'YIN ANONSLARI UCHUN:
-
-Faqat juda qiziqarli va ko'pchilik kutayotgan bo'lajak
-o'yinlarni tanla.
-
-Masalan:
-- Real Madrid vs Barcelona
-- Manchester City vs Liverpool
-- Arsenal vs Manchester United
-- Bayern vs PSG
-- Champions League katta uchrashuvlari
-
-Oddiy yoki kam qiziqishdagi o'yinlarni anons qilma.
-
-image_mode:
-
-"original" — oddiy yangilik, transfer, jarohat, natija va hokazo.
-
-"ai" — faqat muhim BO'LAJAK o'yin/anons bo'lsa.
-
-match_datetime_utc:
-
-Faqat manbada o'yinning aniq sanasi va vaqti berilgan bo'lsa
-uni UTC formatida yoz.
-
-Agar manbada aniq vaqt bo'lmasa:
-""
-
-Juda muhim:
-- Vaqtni taxmin qilma.
-- Sana yoki vaqtni o'ylab topma.
-
-JSON formatida javob ber:
-
-[
-  {{
-    "title_uz": "O'zbekcha qisqa sarlavha",
-    "text_uz": "O'zbekcha 2-4 gaplik mazmunli matn",
-    "category": "player|transfer|match|result|injury|manager|breaking|other",
-    "importance": 1,
-    "image_mode": "original|ai",
-    "match_datetime_utc": ""
-  }}
-]
-
-importance 1 dan 10 gacha.
-
-Faqat 7 yoki undan yuqori importance bo'lgan
-yangiliklarni tanla.
-
-YANGILIKLAR:
-
-{''.join(news_text)}
-"""
-
-    response = ask_gemini(prompt)
-
-    if not response:
-        return []
-
-    try:
-
-        selected = safe_json(response)
-
-    except Exception as e:
-
-        print("Gemini JSON xatosi:", repr(e))
-        print("Javob:", response)
-
-        return []
-
-    result = []
-
-    for selected_item in selected:
-
-        importance = selected_item.get("importance", 0)
-
-        try:
-            importance = int(importance)
-        except Exception:
-            importance = 0
-
-        if importance < 7:
-            continue
-
-        title = selected_item.get("title_uz", "").strip()
-        text = selected_item.get("text_uz", "").strip()
-
-        if not title or not text:
-            continue
-
-        # Original newsni topamiz
-        source_item = None
-
-        selected_title = title.lower()
-
-        for original in news:
-
-            original_text = (
-                original["title"] + " " +
-                original["description"]
-            ).lower()
-
-            # AI sarlavhasida source title'dagi asosiy so'zlar
-            # bilan bog'lashga harakat
-            words = [
-                w for w in re.findall(
-                    r"[a-zA-ZÀ-ÿА-Яа-я0-9]+",
-                    original["title"].lower()
-                )
-                if len(w) >= 5
-            ]
-
-            matches = sum(
-                1 for word in words
-                if word in selected_title
-            )
-
-            if matches >= 1:
-                source_item = original
-                break
-
-        # Agar topilmasa, navbatdagi mos item
-        if source_item is None and news:
-            source_item = news[0]
-
-        result.append({
-            "title_uz": title,
-            "text_uz": text,
-            "category": selected_item.get(
-                "category",
-                "other"
-            ),
-            "importance": importance,
-            "image_mode": selected_item.get(
-                "image_mode",
-                "original"
-            ),
-            "match_datetime_utc": selected_item.get(
-                "match_datetime_utc",
-                ""
-            ),
-            "image_url": (
-                source_item.get("image_url")
-                if source_item else None
-            ),
-            "source_link": (
-                source_item.get("link")
-                if source_item else ""
-            ),
-        })
-
-    return result[:5]
-
-
-# =========================================================
-# AI MATCH POSTER
-# =========================================================
-
-def generate_ai_match_image(title, text):
-
-    prompt = f"""
-Create a professional football news poster for "Futbol Pulse".
-
-FORMAT:
-16:9 landscape.
-
-SUBJECT:
-{title}
-
-STORY:
-{text}
-
-STYLE:
-- premium modern football media design
-- dramatic stadium atmosphere
-- cinematic lighting
-- realistic football photography style
-- energetic match-day atmosphere
-- two opposing teams facing each other
-- visually show a dramatic player-versus-player duel
-- use the clubs' recognizable colors and football identity
-- if specific players are explicitly named in the story, visually represent those players
-- otherwise use generic star footballers without claiming a specific identity
-- strong composition suitable for Telegram football news
-- no final score
-- do not imply that the match has already happened
-- do not create fake statistics
-- do not add fake quotes
-
-TEXT:
-Keep text on the image minimal.
-Do not add long paragraphs.
-"""
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1/models/"
-        f"{GEMINI_IMAGE_MODEL}:generateContent"
-    )
-
-    data = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": [
-                "IMAGE"
-            ],
-            "imageConfig": {
-                "aspectRatio": "16:9"
-            }
-        }
-    }
-
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        },
-        method="POST",
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=180
-        ) as response:
-
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        candidates = result.get("candidates", [])
-
-        if not candidates:
-            print("AI rasm: candidate topilmadi.")
-            return None
-
-        parts = candidates[0].get(
-            "content",
-            {}
-        ).get(
-            "parts",
-            []
-        )
-
-        for part in parts:
-
-            # API turli naming qaytarishi mumkin
-            image_data = part.get("inlineData")
-
-            if not image_data:
-                image_data = part.get("inline_data")
-
-            if image_data:
-
-                encoded = image_data.get("data")
-
-                if encoded:
-
-                    return base64.b64decode(
-                        encoded
-                    )
-
-    except urllib.error.HTTPError as e:
-
-        error_body = ""
-
-        try:
-            error_body = e.read().decode("utf-8")
-        except Exception:
-            pass
-
-        print("AI RASM HTTP ERROR:", e.code)
-        print(error_body)
-
-    except Exception as e:
-
-        print("AI rasm xatosi:", repr(e))
-
-    return None
-
-
-# =========================================================
-# ORIGINAL RASMNI YUKLASH
-# =========================================================
-
-def download_image(image_url):
-
-    if not image_url:
-        return None
-
-    try:
-
-        request = urllib.request.Request(
-            image_url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/120 Safari/537.36"
-                )
-            }
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            data = response.read()
-
-            content_type = response.headers.get(
-                "Content-Type",
-                ""
-            ).lower()
-
-            if (
-                data
-                and (
-                    content_type.startswith("image/")
-                    or data[:3] == b"\xff\xd8\xff"
-                    or data[:8] == b"\x89PNG\r\n\x1a\n"
-                )
-            ):
-                return data
-
-    except Exception as e:
-
-        print("Rasm yuklash xatosi:", repr(e))
-
-    return None
-
-
-# =========================================================
-# VAQTNI TOSHKENT VAQTIGA O'GIRISH
-# =========================================================
-
-def convert_utc_to_tashkent(utc_string):
-
-    if not utc_string:
-        return ""
-
-    try:
-
-        value = utc_string.strip()
-
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-
-        dt = datetime.fromisoformat(value)
-
-        if dt.tzinfo is None:
-            return ""
-
-        tashkent = dt.astimezone(TASHKENT_TZ)
-
-        return tashkent.strftime(
-            "%d.%m.%Y | %H:%M"
-        )
-
-    except Exception as e:
-
-        print("Vaqt konvertatsiyasi xatosi:", repr(e))
-
-        return ""
-
-
-# =========================================================
-# CATEGORY EMOJILAR
-# =========================================================
 
 CATEGORY_EMOJI = {
-    "player": "⭐",
+    "breaking": "🚨",
     "transfer": "🔄",
-    "match": "🔥",
-    "result": "⚽",
+    "player": "⭐",
     "injury": "🚑",
     "manager": "🧠",
-    "breaking": "🚨",
+    "match": "🔥",
+    "result": "⚽",
     "other": "📰",
 }
 
 
-# =========================================================
-# TELEGRAM POST
-# =========================================================
+def clean_text(value):
+    if not value:
+        return ""
+    value = html.unescape(str(value))
+    value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<style.*?</style>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
-def create_post(item):
 
-    category = item.get(
-        "category",
-        "other"
-    )
+def normalize_title(value):
+    value = clean_text(value).lower()
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
 
-    emoji = CATEGORY_EMOJI.get(
-        category,
-        "📰"
-    )
 
-    title = html.escape(
-        item.get("title_uz", "")
-    )
+def make_id(url, title):
+    raw = (url.strip() + "|" + normalize_title(title)).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-    text = html.escape(
-        item.get("text_uz", "")
-    )
 
-    post = (
-        f"{emoji} <b>{title}</b>\n\n"
-        f"{text}"
-    )
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(data)
+        return set()
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print("STATE LOAD ERROR:", repr(e))
+        return set()
 
-    # Bo'lajak muhim o'yin
-    if item.get("image_mode") == "ai":
 
-        match_time = convert_utc_to_tashkent(
-            item.get(
-                "match_datetime_utc",
-                ""
+def save_state(state):
+    # Keep the repository file small.
+    values = list(state)[-3000:]
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(values, f, ensure_ascii=False, indent=2)
+
+
+def request_text(url, timeout=REQUEST_TIMEOUT):
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+
+def get_meta(soup, *names):
+    for name in names:
+        tag = soup.find("meta", attrs={"property": name})
+        if tag and tag.get("content"):
+            return html.unescape(tag["content"]).strip()
+
+        tag = soup.find("meta", attrs={"name": name})
+        if tag and tag.get("content"):
+            return html.unescape(tag["content"]).strip()
+
+    return ""
+
+
+def parse_date(value):
+    if not value:
+        return None
+
+    value = value.strip()
+
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    try:
+        value2 = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def article_from_jsonld(soup):
+    blocks = []
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        objects = data if isinstance(data, list) else [data]
+
+        for obj in objects:
+            if isinstance(obj, dict) and "@graph" in obj:
+                objects.extend(obj["@graph"])
+
+            if not isinstance(obj, dict):
+                continue
+
+            body = obj.get("articleBody")
+            if isinstance(body, str) and body.strip():
+                blocks.append(body.strip())
+
+    return max(blocks, key=len) if blocks else ""
+
+
+def extract_article_text(soup):
+    body = article_from_jsonld(soup)
+
+    if len(body) >= 700:
+        return clean_text(body)[:MAX_ARTICLE_CHARS]
+
+    candidates = [
+        "article",
+        "[itemprop='articleBody']",
+        "main",
+        ".article-body",
+        ".article__body",
+        ".story-body",
+        ".entry-content",
+        ".content-body",
+    ]
+
+    best = ""
+
+    for selector in candidates:
+        node = soup.select_one(selector)
+        if not node:
+            continue
+
+        paragraphs = [
+            clean_text(p.get_text(" ", strip=True))
+            for p in node.find_all(["p", "h2", "h3"])
+        ]
+
+        paragraphs = [
+            p for p in paragraphs
+            if len(p) >= 35
+            and not p.lower().startswith(
+                ("sign up", "subscribe", "advertisement", "related")
             )
+        ]
+
+        text = "\n".join(paragraphs)
+
+        if len(text) > len(best):
+            best = text
+
+    if len(best) < 500:
+        paragraphs = [
+            clean_text(p.get_text(" ", strip=True))
+            for p in soup.find_all("p")
+        ]
+
+        paragraphs = [p for p in paragraphs if len(p) >= 40]
+        best = "\n".join(paragraphs[:80])
+
+    return best[:MAX_ARTICLE_CHARS]
+
+
+def extract_original_image(soup, article_url):
+    candidates = []
+
+    # The article's own OpenGraph image has priority.
+    og = get_meta(soup, "og:image")
+    if og:
+        candidates.append(urljoin(article_url, og))
+
+    twitter = get_meta(soup, "twitter:image")
+    if twitter:
+        candidates.append(urljoin(article_url, twitter))
+
+    # JSON-LD image is still from the same article page.
+    for script in soup.find_all("script", type="application/ld+json"):
+        raw = script.string or script.get_text()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        objects = data if isinstance(data, list) else [data]
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+
+            image = obj.get("image")
+
+            if isinstance(image, str):
+                candidates.append(urljoin(article_url, image))
+
+            elif isinstance(image, dict):
+                value = image.get("url")
+                if value:
+                    candidates.append(urljoin(article_url, value))
+
+            elif isinstance(image, list):
+                for value in image:
+                    if isinstance(value, str):
+                        candidates.append(urljoin(article_url, value))
+                    elif isinstance(value, dict) and value.get("url"):
+                        candidates.append(
+                            urljoin(article_url, value["url"])
+                        )
+
+    # Same article page only. No Google/image-site search.
+    for img in soup.find_all("img"):
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-original")
+            or img.get("data-lazy-src")
         )
 
-        if match_time:
+        if src:
+            candidates.append(urljoin(article_url, src))
 
-            post += (
-                "\n\n"
-                f"🕐 <b>Toshkent vaqti:</b> "
-                f"{html.escape(match_time)}"
+    seen = set()
+
+    for url in candidates:
+        url = url.strip()
+
+        if not url.startswith(("http://", "https://")):
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        if validate_image(url):
+            return url
+
+    return None
+
+
+def validate_image(url):
+    try:
+        r = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        content_type = r.headers.get("content-type", "").lower()
+        data = r.content
+
+        if "image" not in content_type and not data:
+            return False
+
+        if len(data) < MIN_BYTES:
+            return False
+
+        image = Image.open(BytesIO(data))
+        width, height = image.size
+
+        if width < MIN_WIDTH or height < MIN_HEIGHT:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+def download_image(url):
+    try:
+        r = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        data = r.content
+
+        if len(data) < MIN_BYTES:
+            return None
+
+        image = Image.open(BytesIO(data))
+        image.verify()
+
+        return data
+
+    except Exception as e:
+        print("IMAGE DOWNLOAD ERROR:", repr(e))
+        return None
+
+
+def fetch_article(url, fallback_title="", fallback_description=""):
+    try:
+        r = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        title = (
+            get_meta(soup, "og:title", "twitter:title")
+            or fallback_title
+        )
+
+        description = (
+            get_meta(
+                soup,
+                "og:description",
+                "description",
+                "twitter:description",
+            )
+            or fallback_description
+        )
+
+        article_text = extract_article_text(soup)
+
+        image_url = extract_original_image(
+            soup,
+            url,
+        )
+
+        return {
+            "title": clean_text(title),
+            "description": clean_text(description),
+            "article_text": article_text,
+            "image_url": image_url,
+        }
+
+    except Exception as e:
+        print("ARTICLE ERROR:", url, repr(e))
+
+        return {
+            "title": fallback_title,
+            "description": fallback_description,
+            "article_text": "",
+            "image_url": None,
+        }
+
+
+def fetch_news():
+    results = []
+    seen_urls = set()
+    seen_titles = set()
+
+    for source in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(
+                requests.get(
+                    source["url"],
+                    headers=HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                ).content
             )
 
-        post += "\n\n🔥 <b>Muhim o'yin anonsi</b>"
+            for entry in feed.entries[:MAX_NEWS_PER_SOURCE]:
+                title = clean_text(
+                    getattr(entry, "title", "")
+                )
 
-    post += (
-        "\n\n"
-        f'⚽ <a href="{CHANNEL_LINK}">'
-        f"Futbol Pulse</a>"
+                link = getattr(entry, "link", "")
+                link = urljoin(source["url"], link)
+
+                description = clean_text(
+                    getattr(entry, "summary", "")
+                    or getattr(entry, "description", "")
+                )
+
+                published_raw = (
+                    getattr(entry, "published", "")
+                    or getattr(entry, "updated", "")
+                    or getattr(entry, "created", "")
+                )
+                published_at = parse_date(published_raw)
+
+                if published_at is not None:
+                    age = datetime.now(timezone.utc) - published_at
+                    if age > timedelta(hours=MAX_NEWS_AGE_HOURS):
+                        continue
+
+                if not title or not link:
+                    continue
+
+                if link in seen_urls:
+                    continue
+
+                title_key = normalize_title(title)
+
+                if title_key in seen_titles:
+                    continue
+
+                seen_urls.add(link)
+                seen_titles.add(title_key)
+
+                results.append(
+                    {
+                        "source": source["name"],
+                        "title": title,
+                        "description": description,
+                        "link": link,
+                        "published_at": published_at.isoformat() if published_at else "",
+                    }
+                )
+
+        except Exception as e:
+            print(
+                "RSS ERROR:",
+                source["name"],
+                repr(e),
+            )
+
+    print("RSS NEWS FOUND:", len(results))
+    return results
+
+
+def is_major_match_text(text):
+    lower = text.lower()
+
+    club_count = sum(
+        1 for club in MAJOR_CLUBS
+        if club in lower
     )
 
-    return post
+    match_words = [
+        " vs ",
+        " v ",
+        "versus",
+        "match",
+        "fixture",
+        "kick-off",
+        "kickoff",
+        "live",
+        "preview",
+    ]
 
-
-# =========================================================
-# /START
-# =========================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "⚽ <b>FUTBOL PULSE</b>\n\n"
-        "Bot muvaffaqiyatli ishlayapti! ✅\n\n"
-        "/news — eng muhim futbol yangiliklari",
-        parse_mode="HTML",
+    has_match_word = any(
+        word in lower
+        for word in match_words
     )
 
+    return club_count >= 2 and has_match_word
 
-# =========================================================
-# /NEWS
-# =========================================================
 
-async def news_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def gemini_text(prompt):
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{TEXT_MODEL}:generateContent"
+    )
 
-    status_message = await update.message.reply_text(
-        "⚽ Yangiliklar tekshirilmoqda...\n\n"
-        "🤖 Muhim yangiliklar saralanmoqda..."
+    body = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        "You are the senior editor of Futbol Pulse. "
+                        "You must never invent facts, names, scores, "
+                        "quotes, transfers, dates or injuries."
+                    )
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 6000,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    try:
+        r = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
+            json=body,
+            timeout=90,
+        )
+
+        if not r.ok:
+            print(
+                "GEMINI TEXT ERROR:",
+                r.status_code,
+                r.text[:1000],
+            )
+            return None
+
+        data = r.json()
+
+        parts = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        text = "\n".join(
+            p.get("text", "")
+            for p in parts
+            if p.get("text")
+        ).strip()
+
+        return text or None
+
+    except Exception as e:
+        print("GEMINI TEXT EXCEPTION:", repr(e))
+        return None
+
+
+def parse_json(text):
+    if not text:
+        return None
+
+    text = text.strip()
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
     )
 
     try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
 
-        news = get_news()
-
-        if not news:
-
-            await status_message.edit_text(
-                "Hozircha mos va muhim yangilik topilmadi. ⚽"
-            )
-
-            return
-
-        selected = select_news_with_ai(news)
-
-        if not selected:
-
-            await status_message.edit_text(
-                "Hozircha yetarlicha muhim yangilik topilmadi. ⚽"
-            )
-
-            return
-
-        await status_message.edit_text(
-            f"🔥 {len(selected)} ta muhim yangilik topildi.\n"
-            "Postlar tayyorlanmoqda..."
-        )
-
-        for item in selected:
-
-            image_bytes = None
-
-            # ==========================================
-            # BO'LAJAK MUHIM O'YIN
-            # ==========================================
-
-            if item.get("image_mode") == "ai":
-
-                print(
-                    "AI match poster yaratilmoqda:",
-                    item["title_uz"]
+        if start >= 0 and end > start:
+            try:
+                return json.loads(
+                    text[start:end + 1]
                 )
+            except Exception:
+                pass
 
-                image_bytes = generate_ai_match_image(
-                    item["title_uz"],
-                    item["text_uz"]
-                )
+        return None
 
-            # ==========================================
-            # ODDIY YANGILIK
-            # ORIGINAL RASM
-            # ==========================================
 
-            if image_bytes is None:
+def select_and_write_news(news):
+    source_blocks = []
 
-                image_url = item.get(
-                    "image_url"
-                )
-
-                if image_url:
-
-                    print(
-                        "Original rasm yuklanmoqda:",
-                        image_url
-                    )
-
-                    image_bytes = download_image(
-                        image_url
-                    )
-
-            post = create_post(item)
-
-            # Telegram photo caption 1024 belgidan oshmasligi kerak
-            if len(post) > 1000:
-
-                post = post[:990] + "..."
-
-            # ==========================================
-            # RASM BILAN
-            # ==========================================
-
-            if image_bytes:
-
-                photo = io.BytesIO(
-                    image_bytes
-                )
-
-                photo.name = "futbol_pulse.jpg"
-
-                try:
-
-                    await update.message.reply_photo(
-                        photo=photo,
-                        caption=post,
-                        parse_mode="HTML",
-                        disable_notification=False,
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "Rasmli post xatosi:",
-                        repr(e)
-                    )
-
-                    await update.message.reply_text(
-                        post,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-
-            # ==========================================
-            # RASMSIZ
-            # ==========================================
-
-            else:
-
-                await update.message.reply_text(
-                    post,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-
-        await status_message.edit_text(
-            "✅ Muhim yangiliklar yuborildi."
+    for i, item in enumerate(news):
+        source_blocks.append(
+            f"""
+SOURCE_INDEX: {i}
+SOURCE: {item["source"]}
+TITLE: {item["title"]}
+DESCRIPTION: {item["description"]}
+URL: {item["link"]}
+"""
         )
 
-    except Exception as e:
+    prompt = f"""
+Select only the most important football stories for a Telegram
+channel aimed at Uzbek-speaking football fans.
 
-        print(
-            "NEWS COMMAND ERROR:",
-            repr(e)
-        )
+There can be 0 to {MAX_POSTS_PER_RUN} stories.
 
-        await status_message.edit_text(
-            "❌ Yangiliklarni olishda xatolik yuz berdi."
-        )
+PRIORITY:
+- breaking and official news
+- major transfers
+- Mbappe, Haaland, Vinicius, Bellingham, Yamal, Salah,
+  Messi, Ronaldo and other major players
+- Real Madrid, Barcelona, Manchester City, Manchester United,
+  Liverpool, Arsenal, Chelsea, Bayern, PSG, Juventus, Inter,
+  Milan and other major clubs
+- Champions League, Premier League, La Liga, Serie A,
+  Bundesliga, Ligue 1, World Cup, EURO
+- important injuries, suspensions, coach changes
+- major upcoming matches and live match announcements
 
+REJECT:
+- small routine training updates
+- low-interest minor statistics
+- duplicate stories
+- clickbait without factual substance
+- rumors presented as confirmed facts
+- stories where the source is too vague to support the claim
 
-# =========================================================
-# MAIN
-# =========================================================
+IMAGE RULES — VERY IMPORTANT:
+1. For a normal news story, image_mode MUST be "original".
+2. The program will use ONLY the image from the same source article.
+3. Never ask the program to search for another footballer image.
+4. If the source article has no usable original image, the final post
+   must be allowed to have NO image.
+5. image_mode="ai" is allowed ONLY for a genuinely important upcoming
+   match/live announcement involving at least two major clubs.
+6. For a normal transfer, injury, player news, result or quote,
+   image_mode MUST remain "original".
+7. Never use AI image generation as a fallback for normal news.
 
-def main():
+LANGUAGE:
+- Write the final title and body in natural Uzbek Latin.
+- Preserve names, clubs, competitions and numbers accurately.
+- Fully convey the important factual content available in the source.
+- Do not copy long source passages word-for-word.
+- Do not invent missing details.
 
-    print("====================================")
-    print("⚽ FUTBOL PULSE BOT")
-    print("====================================")
-    print("Bot ishga tushmoqda...")
-    print("Gemini text:", GEMINI_MODEL)
-    print("Gemini image:", GEMINI_IMAGE_MODEL)
-    print("Toshkent timezone: Asia/Tashkent")
-    print("====================================")
+For each selected story, return:
+- source_index: exact integer from the supplied source list
+- title_uz
+- body_uz
+- category: breaking|transfer|player|injury|manager|match|result|other
+- importance: integer 1-10
+- image_mode: original|ai
+- match_datetime_utc: ISO-8601 UTC string ONLY when an upcoming match
+  time is explicitly supported by the source, otherwise empty
+- match_teams: empty unless it is an upcoming match announcement
+- source_claim: a short factual sentence explaining why this story is
+  important, based only on the source
 
-    app = (
-        Application
-        .builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
+For a match announcement:
+- image_mode="ai" only if BOTH teams are major clubs and the match is
+  genuinely important.
+- Do not use image_mode="ai" merely because the story contains the word
+  "match".
+- Do not invent the match time.
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "news",
-            news_command
-        )
-    )
-
-    print("Bot polling rejimida ishlayapti...")
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
-
-if __name__ == "__main__":
-    main()
+Return ONLY this JSON object:
+{{
+  "items": [
+    {{
+      "source_index": 0,
+      "title_uz": "...",
+      "body_uz": "...",
+      "category": "breaking",
+      "importance": 9,
+      "image_mode": 
