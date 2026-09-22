@@ -6,6 +6,7 @@ import html
 import base64
 import hashlib
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
@@ -1137,34 +1138,23 @@ def process_item(item):
     return False
 
 
-def main():
+def publish_once():
+    """Fetch, select and publish fresh football news once."""
     print("==========================================")
-    print("⚽ FUTBOL PULSE v4")
-    print("==========================================")
-    print("Text model:", TEXT_MODEL)
-    print("Image model:", IMAGE_MODEL)
-    print("Original article image: ONLY SAME SOURCE")
-    print("AI image: ONLY MAJOR UPCOMING MATCH")
-    print("Random image search: DISABLED")
+    print("⚽ FUTBOL PULSE — PUBLISH CYCLE")
     print("==========================================")
 
     state = load_state()
-
     news = fetch_news()
 
     if not news:
         print("No RSS news.")
         return
 
-    # Remove already posted stories before sending them to Gemini.
     fresh = []
 
     for item in news:
-        item_id = make_id(
-            item["link"],
-            item["title"],
-        )
-
+        item_id = make_id(item["link"], item["title"])
         item["id"] = item_id
 
         if item_id not in state:
@@ -1177,7 +1167,6 @@ def main():
         return
 
     selected = select_and_write_news(fresh)
-
     print("SELECTED:", len(selected))
 
     if not selected:
@@ -1198,21 +1187,160 @@ def main():
                     item["source_title"],
                 )
             )
-
             save_state(state)
-
-            # Avoid hammering source sites / Telegram.
             time.sleep(2)
 
         except Exception as e:
-            # Do not mark failed stories as posted.
-            print(
-                "POST ERROR:",
-                item["title_uz"],
-                repr(e),
+            print("POST ERROR:", item["title_uz"], repr(e))
+
+    print("PUBLISH CYCLE DONE.")
+
+
+async def start_command(update, context):
+    await update.message.reply_text(
+        "⚽ <b>FUTBOL PULSE</b>\n\n"
+        "Bot ishlayapti! ✅\n\n"
+        "/news — eng muhim futbol yangiliklari",
+        parse_mode="HTML",
+    )
+
+
+def build_user_post(item):
+    emoji = CATEGORY_EMOJI.get(item.get("category", "other"), "📰")
+    title = html.escape(item["title_uz"])
+    body = html.escape(item["body_uz"])
+
+    text = f"{emoji} <b>{title}</b>\n\n{body}"
+
+    if item.get("image_mode") == "ai":
+        text += "\n\n🔥 <b>Muhim o‘yin anonsi</b>"
+
+    text += (
+        f'\n\n📰 <b>Manba:</b> {html.escape(item["source"])}'
+        f'\n⚽ <a href="{CHANNEL_LINK}">Futbol Pulse</a>'
+    )
+
+    return text[:1000] if len(text) > 1000 else text
+
+
+def get_selected_for_command():
+    news = fetch_news()
+    if not news:
+        return []
+
+    selected = select_and_write_news(news)
+    return selected
+
+
+async def news_command(update, context):
+    status = await update.message.reply_text(
+        "⚽ Yangiliklar tekshirilmoqda...\n\n🤖 Muhimlari saralanmoqda..."
+    )
+
+    try:
+        selected = await asyncio.to_thread(get_selected_for_command)
+
+        if not selected:
+            await status.edit_text(
+                "Hozircha yetarlicha muhim yangilik topilmadi. ⚽"
+            )
+            return
+
+        await status.edit_text(
+            f"🔥 {len(selected)} ta muhim yangilik topildi.\n"
+            "🖼️ Rasm tayyorlanmoqda..."
+        )
+
+        for item in selected:
+            image_bytes = await asyncio.to_thread(
+                lambda: (
+                    fetch_article(
+                        item["source_url"],
+                        fallback_title=item["source_title"],
+                        fallback_description="",
+                    ).get("image_url")
+                )
             )
 
-    print("DONE.")
+            photo_bytes = None
+
+            if item.get("image_mode") == "ai":
+                photo_bytes = await asyncio.to_thread(
+                    generate_ai_match_image, item
+                )
+            elif image_bytes:
+                photo_bytes = await asyncio.to_thread(
+                    download_image, image_bytes
+                )
+
+            caption = build_user_post(item)
+
+            if photo_bytes:
+                bio = BytesIO(photo_bytes)
+                bio.name = "futbol_pulse.jpg"
+                await update.message.reply_photo(
+                    photo=bio,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
+        await status.edit_text("✅ Yangiliklar yuborildi.")
+
+    except Exception as e:
+        print("NEWS COMMAND ERROR:", repr(e))
+        await status.edit_text(
+            "❌ Yangiliklarni olishda xatolik yuz berdi."
+        )
+
+
+async def hourly_publisher():
+    """Publish automatically every hour while the process is alive."""
+    while True:
+        try:
+            await asyncio.to_thread(publish_once)
+        except Exception as e:
+            print("HOURLY PUBLISH ERROR:", repr(e))
+
+        await asyncio.sleep(3600)
+
+
+async def post_init(application):
+    application.create_task(hourly_publisher())
+
+
+def main():
+    print("==========================================")
+    print("⚽ FUTBOL PULSE BOT v6")
+    print("==========================================")
+    print("Telegram: /start /news")
+    print("Auto publisher: every 1 hour")
+    print("==========================================")
+
+    try:
+        from telegram import Update
+        from telegram.ext import Application, CommandHandler, ContextTypes
+    except ImportError:
+        print("ERROR: python-telegram-bot is not installed.")
+        raise
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("news", news_command))
+
+    print("Telegram polling started.")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
