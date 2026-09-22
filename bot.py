@@ -765,4 +765,455 @@ Return ONLY this JSON object:
       "body_uz": "...",
       "category": "breaking",
       "importance": 9,
-      "image_mode": 
+      "image_mode": "original",
+      "match_datetime_utc": "",
+      "match_teams": "",
+      "source_claim": "..."
+    }}
+  ]
+}}
+
+SOURCES:
+{"".join(source_blocks)}
+"""
+
+    raw = gemini_text(prompt)
+    data = parse_json(raw)
+
+    if not isinstance(data, dict):
+        print("SELECTION JSON INVALID")
+        return []
+
+    items = data.get("items")
+
+    if not isinstance(items, list):
+        return []
+
+    valid = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            index = int(item.get("source_index"))
+        except Exception:
+            continue
+
+        if index < 0 or index >= len(news):
+            continue
+
+        title = clean_text(item.get("title_uz", ""))
+        body = clean_text(item.get("body_uz", ""))
+
+        if not title or not body:
+            continue
+
+        try:
+            importance = int(item.get("importance", 0))
+        except Exception:
+            importance = 0
+
+        if importance < 7:
+            continue
+
+        category = str(
+            item.get("category", "other")
+        ).lower().strip()
+
+        allowed_categories = set(CATEGORY_EMOJI.keys())
+
+        if category not in allowed_categories:
+            category = "other"
+
+        image_mode = str(
+            item.get("image_mode", "original")
+        ).lower().strip()
+
+        if image_mode not in {"original", "ai"}:
+            image_mode = "original"
+
+        source = news[index]
+
+        combined = (
+            source["title"]
+            + " "
+            + source["description"]
+        )
+
+        # AI image is strictly limited to major upcoming matches.
+        if image_mode == "ai" and not is_major_match_text(combined):
+            image_mode = "original"
+
+        valid.append(
+            {
+                "source_index": index,
+                "source": source["source"],
+                "source_title": source["title"],
+                "source_url": source["link"],
+                "title_uz": title,
+                "body_uz": body,
+                "category": category,
+                "importance": importance,
+                "image_mode": image_mode,
+                "match_datetime_utc": clean_text(
+                    item.get("match_datetime_utc", "")
+                ),
+                "match_teams": clean_text(
+                    item.get("match_teams", "")
+                ),
+                "source_claim": clean_text(
+                    item.get("source_claim", "")
+                ),
+            }
+        )
+
+    # Highest importance first.
+    valid.sort(
+        key=lambda x: x["importance"],
+        reverse=True,
+    )
+
+    return valid[:MAX_POSTS_PER_RUN]
+
+
+def generate_ai_match_image(item):
+    title = item["title_uz"]
+    body = item["body_uz"]
+
+    prompt = f"""
+Create a premium 16:9 football news image for the Futbol Pulse
+Telegram channel.
+
+This is an UPCOMING MATCH ANNOUNCEMENT, not a final result.
+
+MATCH:
+{title}
+
+DETAILS:
+{body}
+
+REQUIREMENTS:
+- 16:9 landscape
+- high quality, sharp, realistic professional sports photography
+- dramatic stadium atmosphere
+- clearly represent the two named clubs
+- authentic-looking club colors and kits
+- if named players are explicitly in the story, they may be represented
+- do not invent a score
+- do not imply that the match has already been played
+- no fake statistics
+- no fake quotes
+- no random unrelated footballers
+- no unrelated clubs
+- minimal or no text inside the image
+- premium sports-news visual
+- natural anatomy and realistic faces
+- suitable for a Telegram football news channel
+"""
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{IMAGE_MODEL}:generateContent"
+    )
+
+    body_json = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ],
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "aspectRatio": "16:9",
+                "imageSize": "2K",
+            },
+        },
+    }
+
+    try:
+        r = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
+            json=body_json,
+            timeout=180,
+        )
+
+        if not r.ok:
+            print(
+                "GEMINI IMAGE ERROR:",
+                r.status_code,
+                r.text[:1200],
+            )
+            return None
+
+        data = r.json()
+
+        parts = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        for part in parts:
+            inline = (
+                part.get("inlineData")
+                or part.get("inline_data")
+            )
+
+            if inline and inline.get("data"):
+                return base64.b64decode(
+                    inline["data"]
+                )
+
+    except Exception as e:
+        print("AI IMAGE EXCEPTION:", repr(e))
+
+    return None
+
+
+def format_post(item):
+    emoji = CATEGORY_EMOJI.get(
+        item["category"],
+        "📰",
+    )
+
+    title = html.escape(item["title_uz"])
+    body = html.escape(item["body_uz"])
+
+    text = (
+        f"{emoji} <b>{title}</b>\n\n"
+        f"{body}"
+    )
+
+    if item["image_mode"] == "ai":
+        text += "\n\n🔥 <b>Muhim o‘yin anonsi</b>"
+
+    text += (
+        f'\n\n📰 <b>Manba:</b> '
+        f'{html.escape(item["source"])}'
+        f'\n⚽ <a href="{CHANNEL_LINK}">Futbol Pulse</a>'
+    )
+
+    # Telegram sendPhoto caption limit.
+    if len(text) > 1000:
+        text = text[:990] + "…"
+
+    return text
+
+
+def telegram_send_message(text):
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    r = requests.post(
+        url,
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if not r.ok:
+        raise RuntimeError(
+            f"Telegram message error {r.status_code}: {r.text}"
+        )
+
+    return r.json()
+
+
+def telegram_send_photo(image_bytes, caption):
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    )
+
+    files = {
+        "photo": (
+            "futbol_pulse.jpg",
+            image_bytes,
+            "image/jpeg",
+        )
+    }
+
+    data = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+
+    r = requests.post(
+        url,
+        data=data,
+        files=files,
+        timeout=60,
+    )
+
+    if not r.ok:
+        raise RuntimeError(
+            f"Telegram photo error {r.status_code}: {r.text}"
+        )
+
+    return r.json()
+
+
+def process_item(item):
+    print(
+        "\nPROCESS:",
+        item["title_uz"],
+        "| image_mode=",
+        item["image_mode"],
+    )
+
+    article = fetch_article(
+        item["source_url"],
+        fallback_title=item["source_title"],
+        fallback_description="",
+    )
+
+    # The image must come from THIS source article.
+    original_image_url = article.get("image_url")
+
+    # For normal news: original image only.
+    if item["image_mode"] == "original":
+        image_bytes = None
+
+        if original_image_url:
+            image_bytes = download_image(
+                original_image_url
+            )
+
+        caption = format_post(item)
+
+        if image_bytes:
+            telegram_send_photo(
+                image_bytes,
+                caption,
+            )
+            print("POSTED WITH ORIGINAL SOURCE IMAGE")
+        else:
+            # Never replace it with another football image.
+            telegram_send_message(caption)
+            print("POSTED WITHOUT IMAGE — no suitable source image")
+
+        return True
+
+    # For a major upcoming match: AI image only.
+    if item["image_mode"] == "ai":
+        image_bytes = generate_ai_match_image(item)
+
+        if image_bytes:
+            telegram_send_photo(
+                image_bytes,
+                format_post(item),
+            )
+            print("POSTED WITH AI MATCH IMAGE")
+            return True
+
+        # AI image failed: do NOT use a random/source image as fallback.
+        # The match announcement is still published as text.
+        telegram_send_message(
+            format_post(item)
+        )
+        print("AI IMAGE FAILED — posted text only")
+        return True
+
+    return False
+
+
+def main():
+    print("==========================================")
+    print("⚽ FUTBOL PULSE v4")
+    print("==========================================")
+    print("Text model:", TEXT_MODEL)
+    print("Image model:", IMAGE_MODEL)
+    print("Original article image: ONLY SAME SOURCE")
+    print("AI image: ONLY MAJOR UPCOMING MATCH")
+    print("Random image search: DISABLED")
+    print("==========================================")
+
+    state = load_state()
+
+    news = fetch_news()
+
+    if not news:
+        print("No RSS news.")
+        return
+
+    # Remove already posted stories before sending them to Gemini.
+    fresh = []
+
+    for item in news:
+        item_id = make_id(
+            item["link"],
+            item["title"],
+        )
+
+        item["id"] = item_id
+
+        if item_id not in state:
+            fresh.append(item)
+
+    print("FRESH NEWS:", len(fresh))
+
+    if not fresh:
+        print("Nothing new to publish.")
+        return
+
+    selected = select_and_write_news(fresh)
+
+    print("SELECTED:", len(selected))
+
+    if not selected:
+        print("No important stories selected.")
+        return
+
+    for item in selected:
+        try:
+            posted = process_item(item)
+
+            if not posted:
+                print("NOT POSTED — state not updated")
+                continue
+
+            state.add(
+                make_id(
+                    item["source_url"],
+                    item["source_title"],
+                )
+            )
+
+            save_state(state)
+
+            # Avoid hammering source sites / Telegram.
+            time.sleep(2)
+
+        except Exception as e:
+            # Do not mark failed stories as posted.
+            print(
+                "POST ERROR:",
+                item["title_uz"],
+                repr(e),
+            )
+
+    print("DONE.")
+
+
+if __name__ == "__main__":
+    main()
